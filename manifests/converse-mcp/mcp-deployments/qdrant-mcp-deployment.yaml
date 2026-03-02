@@ -85,17 +85,55 @@ spec:
                 return toDeterministicUuid(tenantId, String(rawId));
               };
 
-              const server = http.createServer(async (req, res) => {
-                try {
-                  if (req.method === 'GET' && req.url === '/health') { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ status: 'ok', mode: 'http' })); return; }
-                  if (req.method !== 'POST' || req.url !== '/mcp') { res.writeHead(404); res.end(); return; }
+               const server = http.createServer(async (req, res) => {
+                 try {
+                   const pathname = (req.url || '').split('?')[0];
 
-                  const tenantId = (req.headers[TENANT_HEADER]||'').toString().trim();
-                  if (REQUIRE_TENANT && !tenantId) { res.writeHead(401, { 'content-type': 'application/json' }); res.end(JSON.stringify(jsonRpcError(null, -32600, `Missing required tenant header: ${TENANT_HEADER}`))); return; }
+                   if (req.method === 'GET' && pathname === '/health') { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ status: 'ok', mode: 'http' })); return; }
 
-                  let body=''; req.on('data', ch => body+=ch); await new Promise(r=>req.on('end', r));
-                  let rpc; try { rpc = JSON.parse(body); } catch { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify(jsonRpcError(null, -32700, 'Invalid JSON'))); return; }
-                  const batch = Array.isArray(rpc) ? rpc : [rpc];
+                   // Streamable HTTP clients may open a GET stream.
+                   if (req.method === 'GET' && (pathname === '/mcp' || pathname === '/mcp/')) {
+                     // For Streamable HTTP, the gateway may establish an SSE stream first and
+                     // expect a session header back.
+                     let sessionId = (req.headers['mcp-session-id'] || '').toString().trim();
+                     if (!sessionId) sessionId = `mcp-session-${crypto.randomUUID()}`;
+
+                     res.writeHead(200, {
+                       'content-type': 'text/event-stream',
+                       'cache-control': 'no-cache',
+                       'connection': 'keep-alive',
+                       'mcp-session-id': sessionId,
+                     });
+                     res.write(`: connected\n\n`);
+                     const timer = setInterval(() => res.write(`: keepalive ${Date.now()}\n\n`), 15000);
+                     req.on('close', () => clearInterval(timer));
+                     return;
+                   }
+
+                   if (req.method !== 'POST' || !(pathname === '/mcp' || pathname === '/mcp/')) { res.writeHead(404); res.end(); return; }
+
+                   const tenantId = (req.headers[TENANT_HEADER]||'').toString().trim();
+
+                   let body=''; req.on('data', ch => body+=ch); await new Promise(r=>req.on('end', r));
+                   let rpc; try { rpc = JSON.parse(body); } catch { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify(jsonRpcError(null, -32700, 'Invalid JSON'))); return; }
+                   const batch = Array.isArray(rpc) ? rpc : [rpc];
+
+                   // Session header expected by Envoy AI Gateway.
+                   // Some clients (including the inspector) may call `tools/list` directly without
+                   // an explicit `initialize`. To keep the gateway happy, always mint a session
+                   // id if one was not provided.
+                   let sessionId = (req.headers['mcp-session-id'] || '').toString().trim();
+                   if (!sessionId) sessionId = `mcp-session-${crypto.randomUUID()}`;
+                   res.setHeader('mcp-session-id', sessionId);
+
+                   // Only enforce tenant header for tool execution. This keeps `initialize` and
+                   // `tools/list` usable from clients like the MCP inspector without extra headers.
+                   const requiresTenant = batch.some(c => c && c.method === 'tools/call');
+                   if (REQUIRE_TENANT && requiresTenant && !tenantId) {
+                    res.writeHead(401, { 'content-type': 'application/json' });
+                    res.end(JSON.stringify(jsonRpcError(null, -32600, `Missing required tenant header: ${TENANT_HEADER}`)));
+                    return;
+                  }
                   const out = [];
 
                   for (const call of batch) {
@@ -174,6 +212,14 @@ spec:
                     }
 
                     out.push(jsonRpcError(id, -32601, `Unknown tool: ${name}`));
+                  }
+
+                  // Streamable HTTP: notifications are often sent as JSON-RPC objects without an `id`.
+                  // In that case there is no JSON-RPC response; return 202 with an empty body.
+                  if (!Array.isArray(rpc) && out.length === 0) {
+                    res.writeHead(202);
+                    res.end();
+                    return;
                   }
 
                   res.writeHead(200, { 'content-type': 'application/json' });
